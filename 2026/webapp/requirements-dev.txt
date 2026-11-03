@@ -1,0 +1,2 @@
+# Optional: actual browser acceptance tests (Chrome must be installed).
+playwright>=1.50,<2.0

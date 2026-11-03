@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block page %}request{% endblock %}
+{% block content %}
+<div class="page request-page">
+  <div class="page-heading"><div><div class="eyebrow">DISPATCH REQUEST</div><h1>신규 운송 요청</h1><p>배차에 필요한 운송 조건을 입력해주세요.</p></div><span class="step-pill">STEP 01 <span>/ 02</span></span></div>
+  <div class="request-layout">
+    <form id="orderForm" class="request-form">
+      <section class="panel form-section" aria-labelledby="routeHeading">
+        <div class="section-heading"><span class="section-icon">{{ icon('route') }}</span><div><h2 id="routeHeading">운송 구간</h2><p>어디에서 어디로 운송하나요?</p></div><span class="required-note">* 필수 입력</span></div>
+        <div class="route-fields">
+          <div class="field"><label for="pickup"><span class="point pickup-point"></span>상차지 <em>*</em></label><input id="pickup" name="pickup" list="locations" placeholder="상차 지역 또는 거점 검색" autocomplete="off" required maxlength="100" aria-describedby="pickupError"><span class="field-error" id="pickupError" data-error="pickup"></span></div>
+          <button class="swap-button" id="swapLocations" type="button" title="상차지와 하차지 바꾸기" aria-label="상차지와 하차지 바꾸기">⇄</button>
+          <div class="field"><label for="dropoff"><span class="point dropoff-point"></span>하차지 <em>*</em></label><input id="dropoff" name="dropoff" list="locations" placeholder="하차 지역 또는 거점 검색" autocomplete="off" required maxlength="100" aria-describedby="dropoffError"><span class="field-error" id="dropoffError" data-error="dropoff"></span></div>
+        </div>
+        <datalist id="locations"></datalist>
+        <div class="field date-field"><label for="workTime">상차 예정 일시 <em>*</em></label><input id="workTime" name="work_time" type="datetime-local" required aria-describedby="timeHelp timeError"><span class="field-help" id="timeHelp">한국 표준시(KST) 기준으로 입력해주세요.</span><span class="field-error" id="timeError" data-error="work_time"></span></div>
+      </section>
+      <section class="panel form-section" aria-labelledby="cargoHeading">
+        <div class="section-heading"><span class="section-icon">{{ icon('box') }}</span><div><h2 id="cargoHeading">화물 정보</h2><p>운송 요청서에 지정된 컨테이너 타입과 화물 중량을 입력해주세요.</p></div></div>
+
+        <fieldset class="container-choices" aria-describedby="containerError">
+          <legend>컨테이너 타입 <em>*</em></legend>
+          <div class="container-choice-grid">
+            {% for code, label in container_labels.items() %}
+            <label class="container-choice" for="container{{ code }}">
+              <input id="container{{ code }}" type="radio" name="container_type" value="{{ code }}" required aria-describedby="containerError">
+              <span><strong>{{ code }}</strong><small>{{ label }}</small></span>
+            </label>
+            {% endfor %}
+          </div>
+          <span class="field-error" id="containerError" data-error="container_type"></span>
+        </fieldset>
+        <div class="field"><label for="weight">화물 중량 <em>*</em></label><div class="input-unit"><input id="weight" name="weight_kg" type="number" min="0.01" max="100000" step="0.01" required aria-describedby="weightError"><span>kg</span></div><span class="field-error" id="weightError" data-error="weight_kg"></span></div>
+      </section>
+      <div id="formError" class="alert alert-error" role="alert" hidden></div>
+      <div class="form-actions"><span>{{ icon('shield') }}조회 후 차량을 직접 선택할 수 있습니다.</span><button class="button primary" id="recommendButton" type="submit">추천 차량 조회 {{ icon('arrow') }}</button></div>
+    </form>
+    <aside class="request-aside">
+      <section class="panel summary-panel">
+        <div class="eyebrow">REQUEST PREVIEW</div><h2>운송 요청 요약</h2>
+        <div class="preview-route"><div><span class="route-node pickup-node">상</span><div><small>상차지</small><strong id="previewPickup">상차지를 입력해주세요</strong></div></div><div><span class="route-node dropoff-node">하</span><div><small>하차지</small><strong id="previewDropoff">하차지를 입력해주세요</strong></div></div></div>
+        <dl class="summary-details"><div><dt>상차 예정</dt><dd id="previewTime">일시 입력 필요</dd></div><div><dt>화물 중량</dt><dd id="previewWeight">중량 입력 필요</dd></div></dl>
+        <div class="container-preview" aria-live="polite"><div><span>지정 컨테이너</span><span id="gateBadge" class="badge neutral">확인 대기</span></div><strong id="containerType">—</strong><p id="containerReason">컨테이너 타입을 선택하면 중량 기준을 확인합니다.</p></div>
+        <div id="gateMessage" class="gate-help"></div>
+      </section>
+      <section class="guide-panel"><div>{{ icon('target') }}<h3>추천 기준</h3></div><p>운송 가능한 차량 중 공차거리가 짧고, 도착 여유가 25분에 가까운 차량을 우선 추천합니다.</p><ul><li><span>01</span>가용 시각 24시간 이내·도착 여유 25분 이상 확인</li><li><span>02</span>공차거리 짧은 순으로 비교</li><li><span>03</span>동거리 시 도착 여유·최근 가용 순으로 비교</li></ul><div class="guide-rule">도착 여유 <b id="slackRule">25분 이상</b><br>가용 후 경과시간 <b id="gapRule">24시간 이내</b></div></section>
+    </aside>
+  </div>
+  <footer class="page-footer">ROUTE:ONE <span>운송의 다음 움직임을 연결합니다.</span></footer>
+</div>
+<dialog id="gateDialog" class="confirm-dialog gate-dialog" aria-labelledby="gateDialogTitle">
+  <form method="dialog"><button class="dialog-close" aria-label="중량 판정 안내 닫기">×</button></form>
+  <span class="section-icon">{{ icon('info') }}</span>
+  <div id="gateDialogBadge" class="gate-dialog-badge"></div>
+  <h2 id="gateDialogTitle"></h2>
+  <p id="gateDialogMessage"></p>
+  <div class="gate-limit-panel">
+    <span>허용 중량 범위</span>
+    <strong id="gateDialogLimit"></strong>
+    <p id="gateDialogDelta"></p>
+  </div>
+  <div class="confirm-details gate-dialog-details">
+    <div><span>지정 컨테이너</span><strong id="gateDialogContainer"></strong></div>
+    <div><span>현재 입력 중량</span><strong id="gateDialogWeight"></strong></div>
+    <div><span>과적 경고 기준</span><strong id="gateDialogWarnLimit"></strong></div>
+  </div>
+  <div class="dialog-actions"><button class="button secondary" type="button" id="editGateInput">중량 수정하기</button><button class="button primary" type="button" id="continueWarning" hidden>주의 확인 후 차량 조회</button></div>
+</dialog>
+{% endblock %}
+{% block scripts %}<script type="module" src="{{ url_for('static', filename='js/request.js') }}?v=20260910-empty-defaults"></script>{% endblock %}
+
+

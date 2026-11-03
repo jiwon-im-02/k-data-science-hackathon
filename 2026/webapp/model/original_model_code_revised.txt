@@ -1,0 +1,3647 @@
+# ============================================================
+# PROPOSED FINAL MODEL
+# Stateful Real-Time Unified Vehicle Ranking
+#
+# ============================================================
+# FINAL FIXED PARAMETERS
+# ------------------------------------------------------------
+# Minimum Arrival Slack = 25 min
+# Maximum Work Gap      = 24 h
+#
+# ============================================================
+# DEFINITIONS
+# ------------------------------------------------------------
+#
+# Work Gap
+#   = Order Time - Vehicle Available Time
+#
+# Candidate Work-Gap Gate
+#   0 < Work Gap <= 24 h
+#
+# Empty Travel
+#   = Current Vehicle Location -> New Order Pickup
+#
+# Estimated Arrival
+#   = Vehicle Available Time + Empty Travel Time
+#
+# Arrival Slack
+#   = Order Time - Estimated Arrival
+#
+# Arrival Gate
+#   Arrival Slack >= 25 min
+#
+# Ranking
+#   1. Minimum Empty Distance
+#   2. Minimum Empty Travel Time
+#   3. Maximum Arrival Slack
+#   4. Vehicle ID
+#
+# Stateful Update
+#   Recommended vehicle:
+#       location       -> order dropoff
+#       available_time -> estimated order finish time
+#
+# ============================================================
+# IMPORTANT
+# ------------------------------------------------------------
+# - Future FIXED Schedule 사용하지 않음
+# - Next FIXED Return Constraint 사용하지 않음
+# - Weighted Objective 사용하지 않음
+# - Fallback Cost 사용하지 않음
+# - MILP 아님
+#
+# HISTORY_PATH의 파일명에 FIXED가 들어가지만
+# 현재 코드는 미래 FIXED 스케줄을 활용하지 않고,
+# 해당 파일 안의 과거 차량 운행 이력만
+# State 복원용 History Source로 사용함.
+# ============================================================
+
+
+from pathlib import Path
+from time import perf_counter
+
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# 0. PATH
+# ============================================================
+
+BASE_DIR = Path(
+    r"./공모전\2026_해커톤"
+)
+
+MODEL_PATH = (
+    BASE_DIR
+    / "모델링_최종후보표.xlsx"
+)
+
+HISTORY_PATH = (
+    BASE_DIR
+    / "순차모델링_FIXED스케줄.xlsx"
+)
+
+OD_PATH = (
+    BASE_DIR
+    / "순차모델링_OD캐시.xlsx"
+)
+
+OUTPUT_PATH = (
+    BASE_DIR
+    / "Proposed_FINAL_Slack25_WorkGap24h.xlsx"
+)
+
+
+# ============================================================
+# 1. FINAL CONFIG
+# ============================================================
+
+MIN_ARRIVAL_SLACK_MIN = 25
+
+MAX_WORK_GAP_H = 24
+
+STATE_STALE_CUTOFF_H = 120.0
+
+PROGRESS_EVERY = 250
+
+
+# ============================================================
+# 2. WEIGHT GATE
+#
+# Historical Replay에서 컨테이너/중량이 없으면 미적용.
+# 실제 Demo에서는 주문 입력단에서 적용.
+# ============================================================
+
+WEIGHT_GATE = {
+
+    "20DC": {
+        "warn_kg": 21_500,
+        "block_kg": 21_750,
+    },
+
+    "20RF": {
+        "warn_kg": 21_500,
+        "block_kg": 22_000,
+    },
+
+    "20TK": {
+        "warn_kg": 21_500,
+        "block_kg": 32_270,
+    },
+
+    "40DC": {
+        "warn_kg": 26_000,
+        "block_kg": 26_740,
+    },
+
+    "40HC": {
+        "warn_kg": 26_000,
+        "block_kg": 26_540,
+    },
+
+    "40OT": {
+        "warn_kg": 26_000,
+        "block_kg": 26_500,
+    },
+
+    "40RF": {
+        "warn_kg": None,
+        "block_kg": 25_780,
+    },
+
+    "45HC": {
+        "warn_kg": None,
+        "block_kg": 25_760,
+    },
+}
+
+
+# ============================================================
+# 3. UTILITY
+# ============================================================
+
+def clean_text(series):
+
+    s = (
+        series
+        .astype("string")
+        .str.strip()
+    )
+
+    invalid = {
+        "",
+        "nan",
+        "NaN",
+        "None",
+        "<NA>",
+        "NULL",
+        "null",
+    }
+
+    return s.mask(
+        s.isin(invalid)
+    )
+
+
+def valid_text(x):
+
+    if pd.isna(x):
+        return False
+
+    s = str(x).strip()
+
+    if not s:
+        return False
+
+    if s.lower() in {
+        "nan",
+        "none",
+        "<na>",
+        "null",
+    }:
+        return False
+
+    return True
+
+
+def select_sheet(
+    path,
+    candidates,
+):
+
+    names = (
+        pd.ExcelFile(path)
+        .sheet_names
+    )
+
+    for name in candidates:
+
+        if name in names:
+            return name
+
+    raise KeyError(
+        f"\n{path.name}에서 시트를 찾지 못했습니다."
+        f"\n후보: {candidates}"
+        f"\n실제 시트: {names}"
+    )
+
+
+def select_col(
+    df,
+    candidates,
+    required=True,
+):
+
+    for col in candidates:
+
+        if col in df.columns:
+            return col
+
+    if required:
+
+        raise KeyError(
+            "\n필요 컬럼을 찾지 못했습니다."
+            f"\n후보: {candidates}"
+            f"\n실제 컬럼:\n{list(df.columns)}"
+        )
+
+    return None
+
+
+# ============================================================
+# 4. WEIGHT GATE FUNCTION
+# ============================================================
+
+def judge_weight_gate(
+    container_type,
+    weight_kg,
+):
+
+    if not valid_text(container_type):
+        return "UNKNOWN_TYPE"
+
+    ctype = (
+        str(container_type)
+        .strip()
+        .upper()
+    )
+
+    if ctype not in WEIGHT_GATE:
+        return "UNKNOWN_TYPE"
+
+    if not np.isfinite(weight_kg):
+        return "UNKNOWN_WEIGHT"
+
+    rule = WEIGHT_GATE[
+        ctype
+    ]
+
+    warn = rule[
+        "warn_kg"
+    ]
+
+    block = rule[
+        "block_kg"
+    ]
+
+    if weight_kg >= block:
+        return "BLOCK"
+
+    if warn is None:
+        return "OK"
+
+    if weight_kg >= warn:
+        return "WARN"
+
+    return "OK"
+
+
+# ============================================================
+# 5. LOAD
+# ============================================================
+
+print("=" * 100)
+print("PROPOSED FINAL MODEL")
+print("=" * 100)
+
+print(
+    f"Minimum Arrival Slack : "
+    f"{MIN_ARRIVAL_SLACK_MIN} min"
+)
+
+print(
+    f"Maximum Work Gap      : "
+    f"{MAX_WORK_GAP_H} h"
+)
+
+print(
+    "Stateful Real-Time Unified Vehicle Ranking"
+)
+
+
+for path in [
+    MODEL_PATH,
+    HISTORY_PATH,
+    OD_PATH,
+]:
+
+    if not path.exists():
+
+        raise FileNotFoundError(
+            f"파일 없음:\n{path}"
+        )
+
+
+TARGET_SHEET = select_sheet(
+    MODEL_PATH,
+    [
+        "03_순차모델링대상",
+        "10_순차모델링대상",
+    ],
+)
+
+HISTORY_SHEET = select_sheet(
+    HISTORY_PATH,
+    [
+        "01_전체스케줄_타겟표시",
+    ],
+)
+
+OD_SHEET = select_sheet(
+    OD_PATH,
+    [
+        "02_ODCache",
+    ],
+)
+
+
+targets = pd.read_excel(
+    MODEL_PATH,
+    sheet_name=TARGET_SHEET,
+)
+
+history = pd.read_excel(
+    HISTORY_PATH,
+    sheet_name=HISTORY_SHEET,
+)
+
+od = pd.read_excel(
+    OD_PATH,
+    sheet_name=OD_SHEET,
+)
+
+
+print("\n[LOAD]")
+
+print(
+    f"Target : {TARGET_SHEET}"
+    f" / {len(targets):,}건"
+)
+
+print(
+    f"History: {HISTORY_SHEET}"
+    f" / {len(history):,}건"
+)
+
+print(
+    f"OD     : {OD_SHEET}"
+    f" / {len(od):,}건"
+)
+
+
+# ============================================================
+# 6. COLUMN MAPPING
+# ============================================================
+
+# ------------------------------------------------------------
+# HISTORY
+# ------------------------------------------------------------
+
+H_VEHICLE = select_col(
+    history,
+    [
+        "차량",
+    ],
+)
+
+H_TIME = select_col(
+    history,
+    [
+        "작업일시",
+    ],
+)
+
+H_DROPOFF_REP = select_col(
+    history,
+    [
+        "현재하차지_rep",
+        "하차지_rep",
+    ],
+)
+
+H_TARGET_FLAG = select_col(
+    history,
+    [
+        "재배차대상여부",
+    ],
+    required=False,
+)
+
+
+# ------------------------------------------------------------
+# TARGET
+# ------------------------------------------------------------
+
+T_ID = select_col(
+    targets,
+    [
+        "order_id",
+    ],
+)
+
+T_TIME = select_col(
+    targets,
+    [
+        "order_time",
+    ],
+)
+
+T_PICKUP_REP = select_col(
+    targets,
+    [
+        "order_pickup_rep",
+    ],
+)
+
+T_DROPOFF_REP = select_col(
+    targets,
+    [
+        "order_dropoff_rep",
+    ],
+)
+
+T_FINISH = select_col(
+    targets,
+    [
+        "주문_예상완료시각",
+    ],
+)
+
+T_ACTUAL_VEHICLE = select_col(
+    targets,
+    [
+        "actual_vehicle",
+    ],
+    required=False,
+)
+
+T_ACTUAL_DISPATCH = select_col(
+    targets,
+    [
+        "actual_dispatch",
+    ],
+    required=False,
+)
+
+T_ACTUAL_EMPTY_DIST = select_col(
+    targets,
+    [
+        "actual_empty_distance_km",
+        "실제공차거리_km",
+    ],
+    required=False,
+)
+
+
+# ------------------------------------------------------------
+# CONTAINER / WEIGHT
+# ------------------------------------------------------------
+
+T_CONTAINER_TYPE = select_col(
+    targets,
+    [
+        "타입",
+        "컨테이너타입",
+        "container_type",
+    ],
+    required=False,
+)
+
+T_WEIGHT = select_col(
+    targets,
+    [
+        "중량",
+        "화물중량",
+        "weight",
+        "weight_kg",
+    ],
+    required=False,
+)
+
+
+USE_WEIGHT_GATE = (
+    T_CONTAINER_TYPE is not None
+    and
+    T_WEIGHT is not None
+)
+
+
+print("\n[COLUMN]")
+
+print(
+    f"Container Type : "
+    f"{T_CONTAINER_TYPE}"
+)
+
+print(
+    f"Weight         : "
+    f"{T_WEIGHT}"
+)
+
+print(
+    f"Historical Weight Gate 사용: "
+    f"{USE_WEIGHT_GATE}"
+)
+
+
+# ============================================================
+# 7. CLEAN TARGET
+# ============================================================
+
+targets[
+    T_TIME
+] = pd.to_datetime(
+    targets[
+        T_TIME
+    ],
+    errors="coerce",
+)
+
+targets[
+    T_FINISH
+] = pd.to_datetime(
+    targets[
+        T_FINISH
+    ],
+    errors="coerce",
+)
+
+targets[
+    T_PICKUP_REP
+] = clean_text(
+    targets[
+        T_PICKUP_REP
+    ]
+)
+
+targets[
+    T_DROPOFF_REP
+] = clean_text(
+    targets[
+        T_DROPOFF_REP
+    ]
+)
+
+
+targets = (
+    targets
+    .dropna(
+        subset=[
+            T_ID,
+            T_TIME,
+            T_PICKUP_REP,
+            T_DROPOFF_REP,
+            T_FINISH,
+        ]
+    )
+    .sort_values(
+        [
+            T_TIME,
+            T_ID,
+        ],
+        kind="mergesort",
+    )
+    .drop_duplicates(
+        T_ID,
+        keep="first",
+    )
+    .reset_index(
+        drop=True
+    )
+)
+
+
+N_ORDERS = len(
+    targets
+)
+
+
+print(
+    f"\n순차모델링 주문: "
+    f"{N_ORDERS:,}건"
+)
+
+
+# ============================================================
+# 8. TARGET ARRAYS
+# ============================================================
+
+ORDER_ID = (
+    targets[
+        T_ID
+    ]
+    .astype(str)
+    .to_numpy()
+)
+
+
+ORDER_TIME = (
+    targets[
+        T_TIME
+    ]
+    .to_numpy(
+        dtype="datetime64[ns]"
+    )
+)
+
+
+ORDER_PICKUP = (
+    targets[
+        T_PICKUP_REP
+    ]
+    .astype(str)
+    .to_numpy()
+)
+
+
+ORDER_DROPOFF = (
+    targets[
+        T_DROPOFF_REP
+    ]
+    .astype(str)
+    .to_numpy()
+)
+
+
+ORDER_FINISH = (
+    targets[
+        T_FINISH
+    ]
+    .to_numpy(
+        dtype="datetime64[ns]"
+    )
+)
+
+
+# ------------------------------------------------------------
+# ACTUAL VEHICLE
+# ------------------------------------------------------------
+
+if T_ACTUAL_VEHICLE is not None:
+
+    ORDER_ACTUAL_VEHICLE = (
+        targets[
+            T_ACTUAL_VEHICLE
+        ]
+        .astype("string")
+        .to_numpy()
+    )
+
+else:
+
+    ORDER_ACTUAL_VEHICLE = np.array(
+        [pd.NA] * N_ORDERS,
+        dtype=object,
+    )
+
+
+# ------------------------------------------------------------
+# ACTUAL DISPATCH
+# ------------------------------------------------------------
+
+if T_ACTUAL_DISPATCH is not None:
+
+    ORDER_ACTUAL_DISPATCH = (
+        targets[
+            T_ACTUAL_DISPATCH
+        ]
+        .astype("string")
+        .to_numpy()
+    )
+
+else:
+
+    ORDER_ACTUAL_DISPATCH = np.array(
+        [pd.NA] * N_ORDERS,
+        dtype=object,
+    )
+
+
+# ------------------------------------------------------------
+# ACTUAL EMPTY DISTANCE
+# ------------------------------------------------------------
+
+if T_ACTUAL_EMPTY_DIST is not None:
+
+    ORDER_ACTUAL_EMPTY_DIST = (
+        pd.to_numeric(
+            targets[
+                T_ACTUAL_EMPTY_DIST
+            ],
+            errors="coerce",
+        )
+        .to_numpy(
+            dtype=float
+        )
+    )
+
+else:
+
+    ORDER_ACTUAL_EMPTY_DIST = np.full(
+        N_ORDERS,
+        np.nan,
+        dtype=float,
+    )
+
+
+# ============================================================
+# 9. OPTIONAL WEIGHT GATE
+# ============================================================
+
+if USE_WEIGHT_GATE:
+
+    ORDER_CONTAINER = (
+        targets[
+            T_CONTAINER_TYPE
+        ]
+        .astype("string")
+        .str.strip()
+        .to_numpy()
+    )
+
+
+    ORDER_WEIGHT_KG = (
+        pd.to_numeric(
+            targets[
+                T_WEIGHT
+            ],
+            errors="coerce",
+        )
+        .to_numpy(
+            dtype=float
+        )
+    )
+
+
+    ORDER_WEIGHT_GATE = np.empty(
+        N_ORDERS,
+        dtype=object,
+    )
+
+
+    for i in range(
+        N_ORDERS
+    ):
+
+        ORDER_WEIGHT_GATE[
+            i
+        ] = judge_weight_gate(
+            ORDER_CONTAINER[i],
+            ORDER_WEIGHT_KG[i],
+        )
+
+
+else:
+
+    ORDER_CONTAINER = np.array(
+        [pd.NA] * N_ORDERS,
+        dtype=object,
+    )
+
+    ORDER_WEIGHT_KG = np.full(
+        N_ORDERS,
+        np.nan,
+        dtype=float,
+    )
+
+    ORDER_WEIGHT_GATE = np.array(
+        [
+            "NOT_APPLIED"
+        ] * N_ORDERS,
+        dtype=object,
+    )
+
+
+print("\n[WEIGHT GATE]")
+
+print(
+    pd.Series(
+        ORDER_WEIGHT_GATE
+    )
+    .value_counts(
+        dropna=False
+    )
+    .to_string()
+)
+
+
+# ============================================================
+# 10. OD CACHE
+# ============================================================
+
+od[
+    "origin_rep"
+] = clean_text(
+    od[
+        "origin_rep"
+    ]
+)
+
+od[
+    "destination_rep"
+] = clean_text(
+    od[
+        "destination_rep"
+    ]
+)
+
+od[
+    "도로거리_km"
+] = pd.to_numeric(
+    od[
+        "도로거리_km"
+    ],
+    errors="coerce",
+)
+
+od[
+    "예상시간_h"
+] = pd.to_numeric(
+    od[
+        "예상시간_h"
+    ],
+    errors="coerce",
+)
+
+
+od_valid = (
+    od
+    .dropna(
+        subset=[
+            "origin_rep",
+            "destination_rep",
+            "도로거리_km",
+            "예상시간_h",
+        ]
+    )
+    .drop_duplicates(
+        subset=[
+            "origin_rep",
+            "destination_rep",
+        ],
+        keep="first",
+    )
+)
+
+
+OD_MAP = {
+
+    (
+        str(origin),
+        str(destination),
+    ):
+    (
+        float(distance),
+        float(time_h),
+    )
+
+    for (
+        origin,
+        destination,
+        distance,
+        time_h
+    )
+    in zip(
+        od_valid[
+            "origin_rep"
+        ],
+        od_valid[
+            "destination_rep"
+        ],
+        od_valid[
+            "도로거리_km"
+        ],
+        od_valid[
+            "예상시간_h"
+        ],
+    )
+}
+
+
+print(
+    f"\nOD Map 생성: "
+    f"{len(OD_MAP):,}개"
+)
+
+
+# ============================================================
+# 11. CLEAN HISTORY
+# ============================================================
+
+history[
+    H_VEHICLE
+] = clean_text(
+    history[
+        H_VEHICLE
+    ]
+)
+
+history[
+    H_DROPOFF_REP
+] = clean_text(
+    history[
+        H_DROPOFF_REP
+    ]
+)
+
+history[
+    H_TIME
+] = pd.to_datetime(
+    history[
+        H_TIME
+    ],
+    errors="coerce",
+)
+
+
+history = (
+    history
+    .dropna(
+        subset=[
+            H_VEHICLE,
+            H_TIME,
+            H_DROPOFF_REP,
+        ]
+    )
+    .copy()
+)
+
+
+# ============================================================
+# 12. TARGET ACTUAL EXECUTION EXCLUSION
+#
+# 재배차할 주문의 실제 수행 결과를
+# 차량 State 복원에 사용하지 않음.
+# ============================================================
+
+if H_TARGET_FLAG is not None:
+
+    flag = (
+        history[
+            H_TARGET_FLAG
+        ]
+        .astype("string")
+        .str.strip()
+        .str.upper()
+    )
+
+
+    history_state = (
+        history[
+            flag != "O"
+        ]
+        .copy()
+    )
+
+
+    print(
+        "\n재배차 대상 실제 수행이력 제외: "
+        f"{len(history) - len(history_state):,}건"
+    )
+
+
+else:
+
+    history_state = (
+        history.copy()
+    )
+
+    print(
+        "\n[주의]"
+        " 재배차대상여부 컬럼 없음."
+    )
+
+
+history_state = (
+    history_state
+    .sort_values(
+        [
+            H_TIME,
+            H_VEHICLE,
+        ],
+        kind="mergesort",
+    )
+    .reset_index(
+        drop=True
+    )
+)
+
+
+# ============================================================
+# 13. UNIFIED VEHICLE POOL
+# ============================================================
+
+VEHICLES = sorted(
+    history[
+        H_VEHICLE
+    ]
+    .dropna()
+    .astype(str)
+    .unique()
+)
+
+
+N_VEHICLES = len(
+    VEHICLES
+)
+
+
+print(
+    f"\nUnified Vehicle Pool: "
+    f"{N_VEHICLES:,}대"
+)
+
+
+# ============================================================
+# 14. VEHICLE HISTORY INDEX
+# ============================================================
+
+OBS_TIME = []
+
+OBS_LOCATION = []
+
+
+grouped = {
+
+    str(vehicle): group
+
+    for vehicle, group
+    in history_state.groupby(
+        H_VEHICLE,
+        sort=False,
+    )
+}
+
+
+for vehicle in VEHICLES:
+
+    g = grouped.get(
+        vehicle
+    )
+
+
+    if g is None:
+
+        OBS_TIME.append(
+            np.empty(
+                0,
+                dtype="datetime64[ns]",
+            )
+        )
+
+        OBS_LOCATION.append(
+            np.empty(
+                0,
+                dtype=object,
+            )
+        )
+
+        continue
+
+
+    temp = (
+        g[
+            [
+                H_TIME,
+                H_DROPOFF_REP,
+            ]
+        ]
+        .dropna()
+        .copy()
+    )
+
+
+    # --------------------------------------------------------
+    # 동일 차량 + 동일 시각 + 서로 다른 하차 위치
+    # -> State 모호하므로 해당 시각 제외
+    # --------------------------------------------------------
+
+    same_time = (
+        temp
+        .groupby(
+            H_TIME,
+            sort=True,
+        )[
+            H_DROPOFF_REP
+        ]
+        .agg(
+            lambda x:
+                x.iloc[0]
+                if x.nunique() == 1
+                else pd.NA
+        )
+        .dropna()
+        .reset_index()
+    )
+
+
+    OBS_TIME.append(
+        same_time[
+            H_TIME
+        ]
+        .to_numpy(
+            dtype="datetime64[ns]"
+        )
+    )
+
+
+    OBS_LOCATION.append(
+        same_time[
+            H_DROPOFF_REP
+        ]
+        .astype(str)
+        .to_numpy()
+    )
+
+
+print(
+    "차량별 History index 생성 완료"
+)
+
+
+# ============================================================
+# 15. TIME CONSTANTS
+# ============================================================
+
+ONE_MIN_NS = (
+    60_000_000_000
+)
+
+ONE_HOUR_NS = (
+    3_600_000_000_000
+)
+
+
+MIN_SLACK_NS = int(
+    MIN_ARRIVAL_SLACK_MIN
+    * ONE_MIN_NS
+)
+
+
+MAX_WORK_GAP_NS = int(
+    MAX_WORK_GAP_H
+    * ONE_HOUR_NS
+)
+
+
+STATE_STALE_CUTOFF_NS = int(
+    STATE_STALE_CUTOFF_H
+    * ONE_HOUR_NS
+)
+
+
+INT_MIN = (
+    np.iinfo(
+        np.int64
+    ).min
+)
+
+
+# ============================================================
+# 16. FINAL STATEFUL SIMULATION
+# ============================================================
+
+def run_final_simulation():
+
+    start = (
+        perf_counter()
+    )
+
+
+    # --------------------------------------------------------
+    # Observed History Pointer
+    # --------------------------------------------------------
+
+    obs_ptr = np.full(
+        N_VEHICLES,
+        -1,
+        dtype=np.int32,
+    )
+
+
+    # --------------------------------------------------------
+    # Proposed Simulated State
+    # --------------------------------------------------------
+
+    sim_has_state = np.zeros(
+        N_VEHICLES,
+        dtype=bool,
+    )
+
+    sim_location = np.empty(
+        N_VEHICLES,
+        dtype=object,
+    )
+
+    sim_available_ns = np.full(
+        N_VEHICLES,
+        INT_MIN,
+        dtype=np.int64,
+    )
+
+
+    rows = []
+
+
+    print("\n")
+    print("=" * 100)
+    print("FINAL STATEFUL SIMULATION")
+    print("=" * 100)
+
+    print(
+        f"Minimum Arrival Slack = "
+        f"{MIN_ARRIVAL_SLACK_MIN} min"
+    )
+
+    print(
+        f"Maximum Work Gap = "
+        f"{MAX_WORK_GAP_H} h"
+    )
+
+
+    # ========================================================
+    # ORDER LOOP
+    # ========================================================
+
+    for i in range(
+        N_ORDERS
+    ):
+
+        order_time_np = (
+            ORDER_TIME[i]
+        )
+
+
+        order_time_ns = (
+            order_time_np
+            .astype(
+                "datetime64[ns]"
+            )
+            .astype(
+                np.int64
+            )
+        )
+
+
+        finish_ns = (
+            ORDER_FINISH[i]
+            .astype(
+                "datetime64[ns]"
+            )
+            .astype(
+                np.int64
+            )
+        )
+
+
+        pickup = (
+            ORDER_PICKUP[i]
+        )
+
+        dropoff = (
+            ORDER_DROPOFF[i]
+        )
+
+        gate_status = (
+            ORDER_WEIGHT_GATE[i]
+        )
+
+
+        # ====================================================
+        # A. OBSERVED HISTORY POINTER UPDATE
+        # ====================================================
+
+        for v_idx in range(
+            N_VEHICLES
+        ):
+
+            times = (
+                OBS_TIME[
+                    v_idx
+                ]
+            )
+
+            p = (
+                obs_ptr[
+                    v_idx
+                ]
+            )
+
+            next_p = (
+                p + 1
+            )
+
+
+            while (
+                next_p
+                <
+                len(times)
+                and
+                times[
+                    next_p
+                ]
+                <
+                order_time_np
+            ):
+
+                p = (
+                    next_p
+                )
+
+                next_p += 1
+
+
+            obs_ptr[
+                v_idx
+            ] = p
+
+
+        # ====================================================
+        # B. WEIGHT BLOCK
+        # ====================================================
+
+        if gate_status == "BLOCK":
+
+            rows.append({
+
+                "order_id":
+                    ORDER_ID[i],
+
+                "order_time":
+                    pd.Timestamp(
+                        order_time_np
+                    ),
+
+                "minimum_arrival_slack_min":
+                    MIN_ARRIVAL_SLACK_MIN,
+
+                "max_work_gap_h":
+                    MAX_WORK_GAP_H,
+
+                "recommendation_status":
+                    "BLOCK",
+
+                "recommended_vehicle":
+                    pd.NA,
+
+                "candidate_count":
+                    0,
+
+                "container_type":
+                    ORDER_CONTAINER[i],
+
+                "weight_kg":
+                    ORDER_WEIGHT_KG[i],
+
+                "weight_gate":
+                    gate_status,
+
+                "actual_vehicle":
+                    ORDER_ACTUAL_VEHICLE[i],
+
+                "actual_dispatch":
+                    ORDER_ACTUAL_DISPATCH[i],
+
+                "actual_empty_distance_km":
+                    ORDER_ACTUAL_EMPTY_DIST[i],
+            })
+
+            continue
+
+
+        # ====================================================
+        # C. CANDIDATE SEARCH
+        # ====================================================
+
+        best_idx = (
+            -1
+        )
+
+        best_distance = (
+            np.inf
+        )
+
+        best_empty_time_h = (
+            np.inf
+        )
+
+        best_slack_min = (
+            -np.inf
+        )
+
+        best_work_gap_h = (
+            np.nan
+        )
+
+        best_location = (
+            None
+        )
+
+        best_available_ns = (
+            None
+        )
+
+        best_arrival_ns = (
+            None
+        )
+
+        best_source = (
+            None
+        )
+
+        best_state_age_h = (
+            np.nan
+        )
+
+
+        candidate_count = (
+            0
+        )
+
+        excluded_by_work_gap = (
+            0
+        )
+
+        excluded_by_slack = (
+            0
+        )
+
+
+        # ====================================================
+        # VEHICLE LOOP
+        # ====================================================
+
+        for v_idx, vehicle in enumerate(
+            VEHICLES
+        ):
+
+            # ------------------------------------------------
+            # C-1. LATEST OBSERVED STATE
+            # ------------------------------------------------
+
+            p = (
+                obs_ptr[
+                    v_idx
+                ]
+            )
+
+
+            if p >= 0:
+
+                obs_time_np = (
+                    OBS_TIME[
+                        v_idx
+                    ][p]
+                )
+
+                obs_time_ns = (
+                    obs_time_np
+                    .astype(
+                        "datetime64[ns]"
+                    )
+                    .astype(
+                        np.int64
+                    )
+                )
+
+                obs_location = (
+                    OBS_LOCATION[
+                        v_idx
+                    ][p]
+                )
+
+                has_observed = (
+                    True
+                )
+
+
+            else:
+
+                obs_time_ns = (
+                    INT_MIN
+                )
+
+                obs_location = (
+                    None
+                )
+
+                has_observed = (
+                    False
+                )
+
+
+            # ------------------------------------------------
+            # C-2. OBSERVED VS SIMULATED
+            # ------------------------------------------------
+
+            if (
+                sim_has_state[
+                    v_idx
+                ]
+                and
+                (
+                    not has_observed
+                    or
+                    sim_available_ns[
+                        v_idx
+                    ]
+                    >=
+                    obs_time_ns
+                )
+            ):
+
+                available_ns = (
+                    sim_available_ns[
+                        v_idx
+                    ]
+                )
+
+                location = (
+                    sim_location[
+                        v_idx
+                    ]
+                )
+
+                source = (
+                    "simulated_target"
+                )
+
+                state_age_h = (
+                    np.nan
+                )
+
+
+            elif has_observed:
+
+                available_ns = (
+                    obs_time_ns
+                )
+
+                location = (
+                    obs_location
+                )
+
+                source = (
+                    "observed_history"
+                )
+
+                state_age_h = (
+                    order_time_ns
+                    -
+                    available_ns
+                ) / ONE_HOUR_NS
+
+
+            else:
+
+                continue
+
+
+            # ------------------------------------------------
+            # C-3. OBSERVED STATE FRESHNESS
+            # ------------------------------------------------
+
+            if (
+                source
+                ==
+                "observed_history"
+            ):
+
+                state_age_ns = (
+                    order_time_ns
+                    -
+                    available_ns
+                )
+
+
+                if (
+                    state_age_ns
+                    >
+                    STATE_STALE_CUTOFF_NS
+                ):
+
+                    continue
+
+
+            # =================================================
+            # C-4. WORK GAP
+            #
+            # Work Gap
+            #   = Order Time - Vehicle Available Time
+            # =================================================
+
+            work_gap_ns = (
+                order_time_ns
+                -
+                available_ns
+            )
+
+
+            # ------------------------------------------------
+            # Work Gap <= 0
+            # ------------------------------------------------
+
+            if (
+                work_gap_ns
+                <= 0
+            ):
+
+                excluded_by_work_gap += 1
+
+                continue
+
+
+            # ------------------------------------------------
+            # Work Gap > 24 h
+            # ------------------------------------------------
+
+            if (
+                work_gap_ns
+                >
+                MAX_WORK_GAP_NS
+            ):
+
+                excluded_by_work_gap += 1
+
+                continue
+
+
+            work_gap_h = (
+                work_gap_ns
+                /
+                ONE_HOUR_NS
+            )
+
+
+            # =================================================
+            # C-5. CURRENT LOCATION -> PICKUP OD
+            # =================================================
+
+            if (
+                location
+                ==
+                pickup
+            ):
+
+                empty_distance = (
+                    0.0
+                )
+
+                empty_time_h = (
+                    0.0
+                )
+
+
+            else:
+
+                od_value = (
+                    OD_MAP.get(
+                        (
+                            location,
+                            pickup,
+                        )
+                    )
+                )
+
+
+                if od_value is None:
+
+                    continue
+
+
+                (
+                    empty_distance,
+                    empty_time_h,
+                ) = (
+                    od_value
+                )
+
+
+            if (
+                not np.isfinite(
+                    empty_distance
+                )
+                or
+                not np.isfinite(
+                    empty_time_h
+                )
+            ):
+
+                continue
+
+
+            # =================================================
+            # C-6. ESTIMATED ARRIVAL
+            #
+            # Available Time + Empty Travel Time
+            # =================================================
+
+            travel_ns = int(
+                empty_time_h
+                *
+                ONE_HOUR_NS
+            )
+
+
+            estimated_arrival_ns = (
+                available_ns
+                +
+                travel_ns
+            )
+
+
+            # =================================================
+            # C-7. ARRIVAL SLACK
+            #
+            # Order Time - Estimated Arrival
+            # =================================================
+
+            arrival_slack_ns = (
+                order_time_ns
+                -
+                estimated_arrival_ns
+            )
+
+
+            arrival_slack_min = (
+                arrival_slack_ns
+                /
+                ONE_MIN_NS
+            )
+
+
+            # =================================================
+            # C-8. ARRIVAL SLACK >= 25 MIN
+            # =================================================
+
+            if (
+                arrival_slack_ns
+                <
+                MIN_SLACK_NS
+            ):
+
+                excluded_by_slack += 1
+
+                continue
+
+
+            candidate_count += 1
+
+
+            # =================================================
+            # C-9. RANKING
+            #
+            # 1. Minimum Empty Distance
+            # 2. Minimum Empty Time
+            # 3. Maximum Arrival Slack
+            # 4. Vehicle ID
+            # =================================================
+
+            is_better = (
+                False
+            )
+
+
+            if (
+                empty_distance
+                <
+                best_distance
+            ):
+
+                is_better = (
+                    True
+                )
+
+
+            elif (
+                empty_distance
+                ==
+                best_distance
+            ):
+
+                if (
+                    empty_time_h
+                    <
+                    best_empty_time_h
+                ):
+
+                    is_better = (
+                        True
+                    )
+
+
+                elif (
+                    empty_time_h
+                    ==
+                    best_empty_time_h
+                ):
+
+                    if (
+                        arrival_slack_min
+                        >
+                        best_slack_min
+                    ):
+
+                        is_better = (
+                            True
+                        )
+
+
+                    elif (
+                        arrival_slack_min
+                        ==
+                        best_slack_min
+                        and
+                        best_idx >= 0
+                        and
+                        vehicle
+                        <
+                        VEHICLES[
+                            best_idx
+                        ]
+                    ):
+
+                        is_better = (
+                            True
+                        )
+
+
+            if is_better:
+
+                best_idx = (
+                    v_idx
+                )
+
+                best_distance = float(
+                    empty_distance
+                )
+
+                best_empty_time_h = float(
+                    empty_time_h
+                )
+
+                best_slack_min = float(
+                    arrival_slack_min
+                )
+
+                best_work_gap_h = float(
+                    work_gap_h
+                )
+
+                best_location = (
+                    location
+                )
+
+                best_available_ns = int(
+                    available_ns
+                )
+
+                best_arrival_ns = int(
+                    estimated_arrival_ns
+                )
+
+                best_source = (
+                    source
+                )
+
+                best_state_age_h = (
+                    state_age_h
+                )
+
+
+        # ====================================================
+        # D. NO FEASIBLE
+        # ====================================================
+
+        if best_idx < 0:
+
+            rows.append({
+
+                "order_id":
+                    ORDER_ID[i],
+
+                "order_time":
+                    pd.Timestamp(
+                        order_time_np
+                    ),
+
+                "minimum_arrival_slack_min":
+                    MIN_ARRIVAL_SLACK_MIN,
+
+                "max_work_gap_h":
+                    MAX_WORK_GAP_H,
+
+                "recommendation_status":
+                    "NO_FEASIBLE",
+
+                "recommended_vehicle":
+                    pd.NA,
+
+                "candidate_count":
+                    0,
+
+                "excluded_by_work_gap_count":
+                    excluded_by_work_gap,
+
+                "excluded_by_slack_count":
+                    excluded_by_slack,
+
+                "container_type":
+                    ORDER_CONTAINER[i],
+
+                "weight_kg":
+                    ORDER_WEIGHT_KG[i],
+
+                "weight_gate":
+                    gate_status,
+
+                "actual_vehicle":
+                    ORDER_ACTUAL_VEHICLE[i],
+
+                "actual_dispatch":
+                    ORDER_ACTUAL_DISPATCH[i],
+
+                "actual_empty_distance_km":
+                    ORDER_ACTUAL_EMPTY_DIST[i],
+            })
+
+
+        # ====================================================
+        # E. RECOMMENDED
+        # ====================================================
+
+        else:
+
+            best_vehicle = (
+                VEHICLES[
+                    best_idx
+                ]
+            )
+
+
+            # ------------------------------------------------
+            # STATEFUL UPDATE
+            # ------------------------------------------------
+
+            sim_has_state[
+                best_idx
+            ] = (
+                True
+            )
+
+
+            sim_location[
+                best_idx
+            ] = (
+                dropoff
+            )
+
+
+            sim_available_ns[
+                best_idx
+            ] = (
+                finish_ns
+            )
+
+
+            # ------------------------------------------------
+            # ACTUAL COMPARISON
+            # ------------------------------------------------
+
+            actual_empty = (
+                ORDER_ACTUAL_EMPTY_DIST[
+                    i
+                ]
+            )
+
+
+            if np.isfinite(
+                actual_empty
+            ):
+
+                saving_distance = (
+                    actual_empty
+                    -
+                    best_distance
+                )
+
+
+                if actual_empty > 0:
+
+                    order_saving_rate = (
+                        saving_distance
+                        /
+                        actual_empty
+                    )
+
+                else:
+
+                    order_saving_rate = (
+                        np.nan
+                    )
+
+
+            else:
+
+                saving_distance = (
+                    np.nan
+                )
+
+                order_saving_rate = (
+                    np.nan
+                )
+
+
+            rows.append({
+
+                # --------------------------------------------
+                # SETTINGS
+                # --------------------------------------------
+
+                "minimum_arrival_slack_min":
+                    MIN_ARRIVAL_SLACK_MIN,
+
+                "max_work_gap_h":
+                    MAX_WORK_GAP_H,
+
+                # --------------------------------------------
+                # ORDER
+                # --------------------------------------------
+
+                "order_id":
+                    ORDER_ID[i],
+
+                "order_time":
+                    pd.Timestamp(
+                        order_time_np
+                    ),
+
+                "order_pickup_rep":
+                    pickup,
+
+                "order_dropoff_rep":
+                    dropoff,
+
+                # --------------------------------------------
+                # RECOMMENDATION
+                # --------------------------------------------
+
+                "recommendation_status":
+                    "RECOMMENDED",
+
+                "recommended_vehicle":
+                    best_vehicle,
+
+                "candidate_count":
+                    candidate_count,
+
+                "excluded_by_work_gap_count":
+                    excluded_by_work_gap,
+
+                "excluded_by_slack_count":
+                    excluded_by_slack,
+
+                # --------------------------------------------
+                # VEHICLE STATE
+                # --------------------------------------------
+
+                "vehicle_before_location":
+                    best_location,
+
+                "vehicle_available_time":
+                    pd.to_datetime(
+                        best_available_ns
+                    ),
+
+                "state_source":
+                    best_source,
+
+                "observed_state_age_h":
+                    best_state_age_h,
+
+                # --------------------------------------------
+                # WORK GAP
+                # --------------------------------------------
+
+                "work_gap_h":
+                    best_work_gap_h,
+
+                "work_gap_min":
+                    best_work_gap_h
+                    * 60.0,
+
+                # --------------------------------------------
+                # EMPTY TRAVEL
+                # --------------------------------------------
+
+                "recommended_empty_distance_km":
+                    best_distance,
+
+                "recommended_empty_time_h":
+                    best_empty_time_h,
+
+                "recommended_empty_time_min":
+                    best_empty_time_h
+                    * 60.0,
+
+                # --------------------------------------------
+                # ARRIVAL
+                # --------------------------------------------
+
+                "estimated_arrival_time":
+                    pd.to_datetime(
+                        best_arrival_ns
+                    ),
+
+                "arrival_slack_min":
+                    best_slack_min,
+
+                "arrival_slack_h":
+                    best_slack_min
+                    / 60.0,
+
+                # --------------------------------------------
+                # FINISH
+                # --------------------------------------------
+
+                "estimated_finish_time":
+                    pd.Timestamp(
+                        ORDER_FINISH[i]
+                    ),
+
+                # --------------------------------------------
+                # WEIGHT
+                # --------------------------------------------
+
+                "container_type":
+                    ORDER_CONTAINER[i],
+
+                "weight_kg":
+                    ORDER_WEIGHT_KG[i],
+
+                "weight_gate":
+                    gate_status,
+
+                # --------------------------------------------
+                # ACTUAL
+                # --------------------------------------------
+
+                "actual_vehicle":
+                    ORDER_ACTUAL_VEHICLE[i],
+
+                "actual_dispatch":
+                    ORDER_ACTUAL_DISPATCH[i],
+
+                "actual_empty_distance_km":
+                    actual_empty,
+
+                # --------------------------------------------
+                # SAVING
+                # --------------------------------------------
+
+                "saving_distance_km":
+                    saving_distance,
+
+                "order_empty_saving_rate":
+                    order_saving_rate,
+            })
+
+
+        # ====================================================
+        # PROGRESS
+        # ====================================================
+
+        if (
+            (i + 1)
+            %
+            PROGRESS_EVERY
+            == 0
+            or
+            i + 1
+            ==
+            N_ORDERS
+        ):
+
+            elapsed = (
+                perf_counter()
+                -
+                start
+            )
+
+
+            print(
+                f"  {i + 1:>5,}"
+                f" / {N_ORDERS:,}"
+                f" 완료"
+                f" | {elapsed:,.1f} sec"
+            )
+
+
+    result_df = (
+        pd.DataFrame(
+            rows
+        )
+    )
+
+
+    elapsed = (
+        perf_counter()
+        -
+        start
+    )
+
+
+    print(
+        f"\nSimulation 완료"
+        f" | {elapsed:,.1f} sec"
+    )
+
+
+    return result_df
+
+
+# ============================================================
+# 17. VEHICLE-LEVEL SAVING TABLE
+# ============================================================
+
+def make_vehicle_saving_table(
+    result_df,
+):
+
+    compare_df = result_df[
+        (
+            result_df[
+                "recommendation_status"
+            ]
+            ==
+            "RECOMMENDED"
+        )
+        &
+        (
+            result_df[
+                "recommended_vehicle"
+            ].notna()
+        )
+        &
+        (
+            result_df[
+                "actual_empty_distance_km"
+            ].notna()
+        )
+        &
+        (
+            result_df[
+                "recommended_empty_distance_km"
+            ].notna()
+        )
+    ].copy()
+
+
+    if len(
+        compare_df
+    ) == 0:
+
+        return (
+            pd.DataFrame()
+        )
+
+
+    vehicle_df = (
+        compare_df
+        .groupby(
+            "recommended_vehicle",
+            dropna=False,
+        )
+        .agg(
+
+            추천건수=(
+                "order_id",
+                "count"
+            ),
+
+            실제공차거리합_km=(
+                "actual_empty_distance_km",
+                "sum"
+            ),
+
+            추천공차거리합_km=(
+                "recommended_empty_distance_km",
+                "sum"
+            ),
+
+            실제공차거리평균_km=(
+                "actual_empty_distance_km",
+                "mean"
+            ),
+
+            추천공차거리평균_km=(
+                "recommended_empty_distance_km",
+                "mean"
+            ),
+
+        )
+        .reset_index()
+    )
+
+
+    # --------------------------------------------------------
+    # SAVING DISTANCE
+    # --------------------------------------------------------
+
+    vehicle_df[
+        "공차절감거리_km"
+    ] = (
+        vehicle_df[
+            "실제공차거리합_km"
+        ]
+        -
+        vehicle_df[
+            "추천공차거리합_km"
+        ]
+    )
+
+
+    # --------------------------------------------------------
+    # VEHICLE SAVING RATE
+    # --------------------------------------------------------
+
+    vehicle_df[
+        "차량별공차절감률"
+    ] = np.where(
+
+        vehicle_df[
+            "실제공차거리합_km"
+        ]
+        > 0,
+
+        (
+            vehicle_df[
+                "공차절감거리_km"
+            ]
+            /
+            vehicle_df[
+                "실제공차거리합_km"
+            ]
+        ),
+
+        np.nan,
+    )
+
+
+    vehicle_df[
+        "차량별공차절감률_pct"
+    ] = (
+        vehicle_df[
+            "차량별공차절감률"
+        ]
+        * 100.0
+    )
+
+
+    vehicle_df[
+        "실제대비개선차량여부"
+    ] = np.where(
+
+        vehicle_df[
+            "추천공차거리합_km"
+        ]
+        <
+        vehicle_df[
+            "실제공차거리합_km"
+        ],
+
+        "O",
+
+        "X",
+    )
+
+
+    vehicle_df = (
+        vehicle_df
+        .sort_values(
+            [
+                "차량별공차절감률",
+                "추천건수",
+            ],
+            ascending=[
+                False,
+                False,
+            ],
+            na_position="last",
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+
+    return vehicle_df
+
+
+# ============================================================
+# 18. EVALUATION
+# ============================================================
+
+def evaluate(
+    result_df,
+):
+
+    total_n = (
+        len(
+            result_df
+        )
+    )
+
+
+    blocked = (
+        result_df[
+            result_df[
+                "recommendation_status"
+            ]
+            ==
+            "BLOCK"
+        ]
+    )
+
+
+    recommended = (
+        result_df[
+            result_df[
+                "recommendation_status"
+            ]
+            ==
+            "RECOMMENDED"
+        ]
+        .copy()
+    )
+
+
+    no_feasible = (
+        result_df[
+            result_df[
+                "recommendation_status"
+            ]
+            ==
+            "NO_FEASIBLE"
+        ]
+    )
+
+
+    blocked_n = (
+        len(
+            blocked
+        )
+    )
+
+    eligible_n = (
+        total_n
+        -
+        blocked_n
+    )
+
+    rec_n = (
+        len(
+            recommended
+        )
+    )
+
+
+    recommendation_rate = (
+        rec_n
+        /
+        eligible_n
+
+        if eligible_n > 0
+
+        else np.nan
+    )
+
+
+    # ========================================================
+    # RECOMMENDATION METRICS
+    # ========================================================
+
+    if rec_n > 0:
+
+        avg_candidate = (
+            recommended[
+                "candidate_count"
+            ].mean()
+        )
+
+        median_candidate = (
+            recommended[
+                "candidate_count"
+            ].median()
+        )
+
+
+        avg_work_gap = (
+            recommended[
+                "work_gap_h"
+            ].mean()
+        )
+
+        median_work_gap = (
+            recommended[
+                "work_gap_h"
+            ].median()
+        )
+
+        q95_work_gap = (
+            recommended[
+                "work_gap_h"
+            ].quantile(
+                0.95
+            )
+        )
+
+
+        avg_distance = (
+            recommended[
+                "recommended_empty_distance_km"
+            ].mean()
+        )
+
+        median_distance = (
+            recommended[
+                "recommended_empty_distance_km"
+            ].median()
+        )
+
+
+        zero_distance_rate = (
+            recommended[
+                "recommended_empty_distance_km"
+            ]
+            <=
+            1e-9
+        ).mean()
+
+
+        avg_empty_time = (
+            recommended[
+                "recommended_empty_time_min"
+            ].mean()
+        )
+
+        median_empty_time = (
+            recommended[
+                "recommended_empty_time_min"
+            ].median()
+        )
+
+
+        avg_slack = (
+            recommended[
+                "arrival_slack_min"
+            ].mean()
+        )
+
+        median_slack = (
+            recommended[
+                "arrival_slack_min"
+            ].median()
+        )
+
+        q25_slack = (
+            recommended[
+                "arrival_slack_min"
+            ].quantile(
+                0.25
+            )
+        )
+
+        q75_slack = (
+            recommended[
+                "arrival_slack_min"
+            ].quantile(
+                0.75
+            )
+        )
+
+
+    else:
+
+        avg_candidate = (
+            np.nan
+        )
+
+        median_candidate = (
+            np.nan
+        )
+
+        avg_work_gap = (
+            np.nan
+        )
+
+        median_work_gap = (
+            np.nan
+        )
+
+        q95_work_gap = (
+            np.nan
+        )
+
+        avg_distance = (
+            np.nan
+        )
+
+        median_distance = (
+            np.nan
+        )
+
+        zero_distance_rate = (
+            np.nan
+        )
+
+        avg_empty_time = (
+            np.nan
+        )
+
+        median_empty_time = (
+            np.nan
+        )
+
+        avg_slack = (
+            np.nan
+        )
+
+        median_slack = (
+            np.nan
+        )
+
+        q25_slack = (
+            np.nan
+        )
+
+        q75_slack = (
+            np.nan
+        )
+
+
+    # ========================================================
+    # ORDER-LEVEL ACTUAL COMPARISON
+    # ========================================================
+
+    valid_compare = (
+        recommended[
+            recommended[
+                "actual_empty_distance_km"
+            ].notna()
+            &
+            recommended[
+                "recommended_empty_distance_km"
+            ].notna()
+        ]
+        .copy()
+    )
+
+
+    compare_n = (
+        len(
+            valid_compare
+        )
+    )
+
+
+    if compare_n > 0:
+
+        actual_total = (
+            valid_compare[
+                "actual_empty_distance_km"
+            ].sum()
+        )
+
+        proposed_total = (
+            valid_compare[
+                "recommended_empty_distance_km"
+            ].sum()
+        )
+
+
+        if actual_total > 0:
+
+            saving_rate = (
+                actual_total
+                -
+                proposed_total
+            ) / actual_total
+
+        else:
+
+            saving_rate = (
+                np.nan
+            )
+
+
+        improved_order_rate = (
+            valid_compare[
+                "recommended_empty_distance_km"
+            ]
+            <
+            valid_compare[
+                "actual_empty_distance_km"
+            ]
+        ).mean()
+
+
+        mean_saving_distance = (
+            valid_compare[
+                "actual_empty_distance_km"
+            ]
+            -
+            valid_compare[
+                "recommended_empty_distance_km"
+            ]
+        ).mean()
+
+
+        positive_actual = (
+            valid_compare[
+                valid_compare[
+                    "actual_empty_distance_km"
+                ]
+                > 0
+            ]
+            .copy()
+        )
+
+
+        if len(
+            positive_actual
+        ) > 0:
+
+            order_rates = (
+
+                (
+                    positive_actual[
+                        "actual_empty_distance_km"
+                    ]
+                    -
+                    positive_actual[
+                        "recommended_empty_distance_km"
+                    ]
+                )
+                /
+                positive_actual[
+                    "actual_empty_distance_km"
+                ]
+
+            )
+
+
+            avg_order_saving_rate = (
+                order_rates.mean()
+            )
+
+            median_order_saving_rate = (
+                order_rates.median()
+            )
+
+
+        else:
+
+            avg_order_saving_rate = (
+                np.nan
+            )
+
+            median_order_saving_rate = (
+                np.nan
+            )
+
+
+    else:
+
+        actual_total = (
+            np.nan
+        )
+
+        proposed_total = (
+            np.nan
+        )
+
+        saving_rate = (
+            np.nan
+        )
+
+        improved_order_rate = (
+            np.nan
+        )
+
+        mean_saving_distance = (
+            np.nan
+        )
+
+        avg_order_saving_rate = (
+            np.nan
+        )
+
+        median_order_saving_rate = (
+            np.nan
+        )
+
+
+    # ========================================================
+    # VEHICLE-LEVEL METRICS
+    # ========================================================
+
+    vehicle_level = (
+        make_vehicle_saving_table(
+            result_df
+        )
+    )
+
+
+    if len(
+        vehicle_level
+    ) > 0:
+
+        vehicle_count = (
+            len(
+                vehicle_level
+            )
+        )
+
+
+        improved_vehicle_rate = (
+            vehicle_level[
+                "실제대비개선차량여부"
+            ]
+            .eq(
+                "O"
+            )
+            .mean()
+        )
+
+
+        valid_vehicle_rates = (
+            vehicle_level[
+                "차량별공차절감률"
+            ]
+            .dropna()
+        )
+
+
+        if len(
+            valid_vehicle_rates
+        ) > 0:
+
+            avg_vehicle_saving_rate = (
+                valid_vehicle_rates.mean()
+            )
+
+            median_vehicle_saving_rate = (
+                valid_vehicle_rates.median()
+            )
+
+            q25_vehicle_saving_rate = (
+                valid_vehicle_rates.quantile(
+                    0.25
+                )
+            )
+
+            q75_vehicle_saving_rate = (
+                valid_vehicle_rates.quantile(
+                    0.75
+                )
+            )
+
+
+        else:
+
+            avg_vehicle_saving_rate = (
+                np.nan
+            )
+
+            median_vehicle_saving_rate = (
+                np.nan
+            )
+
+            q25_vehicle_saving_rate = (
+                np.nan
+            )
+
+            q75_vehicle_saving_rate = (
+                np.nan
+            )
+
+
+    else:
+
+        vehicle_count = (
+            0
+        )
+
+        improved_vehicle_rate = (
+            np.nan
+        )
+
+        avg_vehicle_saving_rate = (
+            np.nan
+        )
+
+        median_vehicle_saving_rate = (
+            np.nan
+        )
+
+        q25_vehicle_saving_rate = (
+            np.nan
+        )
+
+        q75_vehicle_saving_rate = (
+            np.nan
+        )
+
+
+    # ========================================================
+    # RETURN
+    # ========================================================
+
+    return {
+
+        # ----------------------------------------------------
+        # FINAL PARAMETERS
+        # ----------------------------------------------------
+
+        "Minimum_Arrival_Slack_min":
+            MIN_ARRIVAL_SLACK_MIN,
+
+        "Maximum_Work_Gap_h":
+            MAX_WORK_GAP_H,
+
+        # ----------------------------------------------------
+        # COVERAGE
+        # ----------------------------------------------------
+
+        "전체주문수":
+            total_n,
+
+        "BLOCK주문수":
+            blocked_n,
+
+        "추천대상주문수":
+            eligible_n,
+
+        "추천성공주문수":
+            rec_n,
+
+        "추천성공률":
+            recommendation_rate,
+
+        "후보없음주문수":
+            len(
+                no_feasible
+            ),
+
+        # ----------------------------------------------------
+        # CANDIDATES
+        # ----------------------------------------------------
+
+        "평균후보차량수":
+            avg_candidate,
+
+        "중앙값후보차량수":
+            median_candidate,
+
+        # ----------------------------------------------------
+        # WORK GAP
+        # ----------------------------------------------------
+
+        "평균추천작업간격_h":
+            avg_work_gap,
+
+        "중앙값추천작업간격_h":
+            median_work_gap,
+
+        "Q95추천작업간격_h":
+            q95_work_gap,
+
+        # ----------------------------------------------------
+        # EMPTY DISTANCE
+        # ----------------------------------------------------
+
+        "평균추천공차거리_km":
+            avg_distance,
+
+        "중앙값추천공차거리_km":
+            median_distance,
+
+        "0km추천비율":
+            zero_distance_rate,
+
+        # ----------------------------------------------------
+        # EMPTY TIME
+        # ----------------------------------------------------
+
+        "평균추천공차시간_min":
+            avg_empty_time,
+
+        "중앙값추천공차시간_min":
+            median_empty_time,
+
+        # ----------------------------------------------------
+        # ARRIVAL SLACK
+        # ----------------------------------------------------
+
+        "평균도착여유_min":
+            avg_slack,
+
+        "중앙값도착여유_min":
+            median_slack,
+
+        "Q25도착여유_min":
+            q25_slack,
+
+        "Q75도착여유_min":
+            q75_slack,
+
+        # ----------------------------------------------------
+        # ORDER-LEVEL COMPARISON
+        # ----------------------------------------------------
+
+        "실제비교가능주문수":
+            compare_n,
+
+        "실제공차거리합_km":
+            actual_total,
+
+        "추천공차거리합_km":
+            proposed_total,
+
+        "공차거리절감률":
+            saving_rate,
+
+        "실제대비개선주문비율":
+            improved_order_rate,
+
+        "주문당평균절감거리_km":
+            mean_saving_distance,
+
+        "평균주문별공차절감률":
+            avg_order_saving_rate,
+
+        "중앙값주문별공차절감률":
+            median_order_saving_rate,
+
+        # ----------------------------------------------------
+        # VEHICLE-LEVEL COMPARISON
+        # ----------------------------------------------------
+
+        "비교차량수":
+            vehicle_count,
+
+        "공차거리개선차량비율":
+            improved_vehicle_rate,
+
+        "평균차량별공차절감률":
+            avg_vehicle_saving_rate,
+
+        "중앙값차량별공차절감률":
+            median_vehicle_saving_rate,
+
+        "Q25차량별공차절감률":
+            q25_vehicle_saving_rate,
+
+        "Q75차량별공차절감률":
+            q75_vehicle_saving_rate,
+    }
+
+
+# ============================================================
+# 19. RUN FINAL MODEL
+# ============================================================
+
+total_start = (
+    perf_counter()
+)
+
+
+result_df = (
+    run_final_simulation()
+)
+
+
+# ============================================================
+# 20. PERIOD SPLIT
+# ============================================================
+
+VALID_START = pd.Timestamp(
+    "2026-02-01 00:00:00"
+)
+
+VALID_END = pd.Timestamp(
+    "2026-02-28 23:59:59"
+)
+
+
+TEST_START = pd.Timestamp(
+    "2026-03-01 00:00:00"
+)
+
+TEST_END = pd.Timestamp(
+    "2026-03-31 23:59:59"
+)
+
+
+order_times = pd.to_datetime(
+    result_df[
+        "order_time"
+    ]
+)
+
+
+valid_df = (
+    result_df[
+        (
+            order_times
+            >=
+            VALID_START
+        )
+        &
+        (
+            order_times
+            <=
+            VALID_END
+        )
+    ]
+    .copy()
+)
+
+
+test_df = (
+    result_df[
+        (
+            order_times
+            >=
+            TEST_START
+        )
+        &
+        (
+            order_times
+            <=
+            TEST_END
+        )
+    ]
+    .copy()
+)
+
+
+# ============================================================
+# 21. SUMMARY
+# ============================================================
+
+summary_rows = []
+
+
+# ------------------------------------------------------------
+# FULL
+# ------------------------------------------------------------
+
+full_metrics = (
+    evaluate(
+        result_df
+    )
+)
+
+full_metrics[
+    "구간"
+] = "FULL"
+
+summary_rows.append(
+    full_metrics
+)
+
+
+# ------------------------------------------------------------
+# VALIDATION
+# ------------------------------------------------------------
+
+if len(
+    valid_df
+) > 0:
+
+    valid_metrics = (
+        evaluate(
+            valid_df
+        )
+    )
+
+    valid_metrics[
+        "구간"
+    ] = "VALIDATION_02"
+
+    summary_rows.append(
+        valid_metrics
+    )
+
+
+# ------------------------------------------------------------
+# HELD-OUT TEST
+# ------------------------------------------------------------
+
+if len(
+    test_df
+) > 0:
+
+    test_metrics = (
+        evaluate(
+            test_df
+        )
+    )
+
+    test_metrics[
+        "구간"
+    ] = "HELDOUT_03"
+
+    summary_rows.append(
+        test_metrics
+    )
+
+
+summary_df = (
+    pd.DataFrame(
+        summary_rows
+    )
+)
+
+
+front_cols = [
+
+    "구간",
+
+    "Minimum_Arrival_Slack_min",
+
+    "Maximum_Work_Gap_h",
+]
+
+
+summary_df = summary_df[
+    front_cols
+    +
+    [
+        c
+        for c
+        in summary_df.columns
+        if c not in front_cols
+    ]
+]
+
+
+# ============================================================
+# 22. VEHICLE-LEVEL SAVING TABLES
+# ============================================================
+
+vehicle_saving_full = (
+    make_vehicle_saving_table(
+        result_df
+    )
+)
+
+
+vehicle_saving_valid = (
+    make_vehicle_saving_table(
+        valid_df
+    )
+)
+
+
+vehicle_saving_test = (
+    make_vehicle_saving_table(
+        test_df
+    )
+)
+
+
+# ============================================================
+# 23. PRINT SUMMARY
+# ============================================================
+
+print("\n")
+print("=" * 100)
+print("FINAL PROPOSED MODEL RESULT")
+print("=" * 100)
+
+
+show = (
+    summary_df.copy()
+)
+
+
+percent_cols = [
+
+    "추천성공률",
+
+    "0km추천비율",
+
+    "공차거리절감률",
+
+    "실제대비개선주문비율",
+
+    "평균주문별공차절감률",
+
+    "중앙값주문별공차절감률",
+
+    "공차거리개선차량비율",
+
+    "평균차량별공차절감률",
+
+    "중앙값차량별공차절감률",
+
+    "Q25차량별공차절감률",
+
+    "Q75차량별공차절감률",
+]
+
+
+for col in percent_cols:
+
+    if col in show.columns:
+
+        show[
+            col
+        ] = (
+            show[
+                col
+            ]
+            * 100.0
+        )
+
+
+pd.set_option(
+    "display.max_columns",
+    None
+)
+
+pd.set_option(
+    "display.width",
+    700
+)
+
+
+print(
+    show.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# 24. VEHICLE SAVING PRINT
+# ============================================================
+
+print("\n")
+print("=" * 100)
+print("차량별 공차 절감 결과 - FULL")
+print("=" * 100)
+
+
+if len(
+    vehicle_saving_full
+) > 0:
+
+    print(
+        vehicle_saving_full
+        .head(
+            30
+        )
+        .to_string(
+            index=False
+        )
+    )
+
+else:
+
+    print(
+        "차량별 비교 가능 데이터 없음"
+    )
+
+
+# ============================================================
+# 25. DESCRIPTION
+# ============================================================
+
+description_df = pd.DataFrame({
+
+    "항목": [
+
+        "모델",
+
+        "최소 도착여유시간",
+
+        "최대 작업간격",
+
+        "Work Gap 정의",
+
+        "공차 이동 정의",
+
+        "예상 도착시각",
+
+        "Arrival Slack 정의",
+
+        "최종 후보 조건",
+
+        "Ranking",
+
+        "Stateful Update",
+
+        "Observed State stale cutoff",
+
+        "미래 FIXED Schedule",
+
+        "Fallback Cost",
+
+        "Weighted Objective",
+
+        "차량별 공차절감률",
+
+        "차량별 절감률 해석",
+
+        "중량 Gate",
+    ],
+
+    "설정": [
+
+        (
+            "Stateful Real-Time "
+            "Unified Vehicle Ranking"
+        ),
+
+        (
+            "25분 "
+            "(Validation 민감도 분석으로 선정)"
+        ),
+
+        (
+            "24시간 "
+            "(6/12/24시간 Validation 민감도 분석으로 선정)"
+        ),
+
+        (
+            "Order Time - "
+            "Vehicle Available Time"
+        ),
+
+        (
+            "현재 차량 위치 "
+            "→ 신규 주문 상차지"
+        ),
+
+        (
+            "Vehicle Available Time "
+            "+ Empty Travel Time"
+        ),
+
+        (
+            "Order Time "
+            "- Estimated Arrival Time"
+        ),
+
+        (
+            "0 < Work Gap <= 24h "
+            "AND Arrival Slack >= 25min"
+        ),
+
+        (
+            "공차거리 최소 "
+            "→ 공차시간 최소 "
+            "→ 도착여유 최대 "
+            "→ Vehicle ID"
+        ),
+
+        (
+            "추천 차량의 위치를 하차지로, "
+            "가용시각을 주문 예상완료시각으로 갱신"
+        ),
+
+        (
+            f"{STATE_STALE_CUTOFF_H:.0f}h"
+        ),
+
+        (
+            "사용하지 않음"
+        ),
+
+        (
+            "사용하지 않음"
+        ),
+
+        (
+            "사용하지 않음"
+        ),
+
+        (
+            "(추천차량 기준 실제공차거리합 "
+            "- 추천공차거리합) "
+            "/ 추천차량 기준 실제공차거리합"
+        ),
+
+        (
+            "동일 실제 차량의 Before/After가 아니라, "
+            "Proposed가 해당 차량을 추천한 주문 집합 기준 비교"
+        ),
+
+        (
+            "Historical 타입/중량 부재 시 미적용. "
+            "실제 Demo 주문 입력단에서 적용"
+        ),
+    ],
+})
+
+
+# ============================================================
+# 26. SAVE EXCEL
+# ============================================================
+
+print("\n")
+print("=" * 100)
+print("Excel 저장 중...")
+print("=" * 100)
+
+
+with pd.ExcelWriter(
+    OUTPUT_PATH,
+    engine="openpyxl",
+) as writer:
+
+
+    # --------------------------------------------------------
+    # 00 설명
+    # --------------------------------------------------------
+
+    description_df.to_excel(
+        writer,
+        sheet_name="00_설명",
+        index=False,
+    )
+
+
+    # --------------------------------------------------------
+    # 01 최종 요약
+    # --------------------------------------------------------
+
+    summary_df.to_excel(
+        writer,
+        sheet_name="01_최종요약",
+        index=False,
+    )
+
+
+    # --------------------------------------------------------
+    # 02 전체 주문
+    # --------------------------------------------------------
+
+    result_df.to_excel(
+        writer,
+        sheet_name="02_전체주문별결과",
+        index=False,
+    )
+
+
+    # --------------------------------------------------------
+    # 03 Validation
+    # --------------------------------------------------------
+
+    valid_df.to_excel(
+        writer,
+        sheet_name="03_Validation_2월",
+        index=False,
+    )
+
+
+    # --------------------------------------------------------
+    # 04 Held-out
+    # --------------------------------------------------------
+
+    test_df.to_excel(
+        writer,
+        sheet_name="04_Heldout_3월",
+        index=False,
+    )
+
+
+    # --------------------------------------------------------
+    # 05 Recommended
+    # --------------------------------------------------------
+
+    recommended_df = (
+        result_df[
+            result_df[
+                "recommendation_status"
+            ]
+            ==
+            "RECOMMENDED"
+        ]
+        .copy()
+    )
+
+
+    recommended_df.to_excel(
+        writer,
+        sheet_name="05_추천성공주문",
+        index=False,
+    )
+
+
+    # ----

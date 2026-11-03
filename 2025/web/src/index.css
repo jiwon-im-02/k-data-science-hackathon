@@ -1,0 +1,78 @@
+/* === Tailwind v4 core import === */
+@import "tailwindcss";
+
+/* v4에서는 스캔 경로를 @source로 CSS 안에서 선언합니다 */
+@source "./index.html";
+@source "./src/**/*.{ts,tsx}";
+
+/* 전역 폰트 */
+html, body {
+  font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+    "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", sans-serif;
+}
+
+/* 홈 히어로 장식용 유틸 */
+.bg-grid {
+  background-image:
+    linear-gradient(to right, rgba(2,6,23,0.06) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(2,6,23,0.06) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+.bg-mesh {
+  background:
+    radial-gradient(circle at 20% 20%, rgba(99,102,241,0.15), transparent 35%),
+    radial-gradient(circle at 80% 10%, rgba(16,185,129,0.15), transparent 35%),
+    radial-gradient(circle at 50% 80%, rgba(56,189,248,0.12), transparent 35%);
+}
+
+@keyframes blob {
+  0%, 100% { transform: translate(0,0) scale(1); }
+  33%      { transform: translate(12px,-12px) scale(1.05); }
+  66%      { transform: translate(-8px,6px) scale(0.98); }
+}
+.animate-blob { animation: blob 8s ease-in-out infinite; }
+.animation-delay-2000 { animation-delay: 2s; }
+.animation-delay-4000 { animation-delay: 4s; }
+
+/* ===== 공용 애니메이션 키프레임 ===== */
+
+/* 선이 점점 그려지는 효과 */
+@keyframes strokeDraw { to { stroke-dashoffset: 0; } }
+
+/* 페이드인 */
+@keyframes fadeIn { to { opacity: 1; } }
+
+/* 팝 (체크/배지 등장) */
+@keyframes pop {
+  0%   { opacity: 0; transform: scale(.85); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+/* (기존) 자유곡선 드로잉 유틸 — 필요 시 사용 */
+@keyframes draw { to { stroke-dashoffset: 0; } }
+.animate-draw {
+  stroke-dasharray: 1200;
+  stroke-dashoffset: 1200;
+  animation: draw 2.8s ease forwards;
+}
+
+/* (기존) 체크 팝 유틸 — 필요 시 사용 */
+.animate-pop {
+  opacity: 0;
+  animation: pop .45s ease forwards;
+  animation-delay: 2.9s;
+}
+
+/* ====== 홍길동 텍스트 아웃라인 애니메이션 ====== */
+/* 1) 외곽선이 먼저 그려짐 */
+.hong-stroke{
+  fill:none;stroke:#0f172a;stroke-width:4;stroke-linecap:round;stroke-linejoin:round;
+  stroke-dasharray:1400;stroke-dashoffset:1400;
+  animation:strokeDraw 1.8s ease forwards .15s; /* 시간은 컴포넌트 drawDur과 일치 */
+}
+.hong-fill{opacity:0;animation:fadeIn .28s linear forwards 2.05s;}
+.hong-pop{opacity:0;transform:scale(.85);transform-origin:center;animation:pop .45s ease forwards 2.2s;}
+@keyframes strokeDraw{to{stroke-dashoffset:0}}
+@keyframes fadeIn{to{opacity:1}}
+@keyframes pop{to{opacity:1;transform:scale(1)}}
+

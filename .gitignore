@@ -1,0 +1,20 @@
+# data and models
+*.xlsx
+*.xls
+*.csv
+*.pkl
+*.RData
+.Rhistory
+user_data/
+data/source/
+data/runtime/
+
+# environments and secrets
+.env
+.env.*
+!.env.example
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+dist/

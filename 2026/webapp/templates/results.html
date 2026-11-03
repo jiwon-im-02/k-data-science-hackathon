@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block page %}results{% endblock %}
+{% block title %}추천 차량 비교 · ROUTE:ONE{% endblock %}
+{% block crumb %}추천 차량 비교{% endblock %}
+{% block head %}<link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet/leaflet.css') }}">{% endblock %}
+{% block content %}
+<div class="page results-page">
+  <div class="page-heading results-heading"><div><a href="/?edit=1" class="back-link">{{ icon('back') }}운송 정보 수정</a><h1>추천 차량 조회 결과</h1><p>차량별 이동 조건을 비교하고 배차 차량을 선택해주세요.</p></div><span class="step-pill">STEP 02 <span>/ 02</span></span></div>
+  <div id="warningBanner" class="alert alert-warning" role="alert" hidden>{{ icon('info') }}<div><strong>과적 주의 · 운송 전 중량 확인이 필요합니다</strong><p id="warningText"></p></div></div>
+  <div id="pageError" class="alert alert-error" role="alert" hidden></div>
+  <div id="loadingState" class="loading-layout" role="status"><div class="loading-copy"><span class="spinner"></span><strong>운행 가능한 차량을 확인하고 있습니다</strong><p>차량 이력과 운송 구간을 바탕으로 추천 순위를 계산합니다.</p></div><div class="skeleton"></div><div class="skeleton"></div></div>
+  <div id="resultContent" hidden>
+    <section class="panel transport-summary" aria-label="신규 운송건 요약">
+      <div class="transport-route"><div><span class="route-node pickup-node">상</span><div><small>상차지</small><strong id="orderPickup"></strong></div></div>{{ icon('arrow') }}<div><span class="route-node dropoff-node">하</span><div><small>하차지</small><strong id="orderDropoff"></strong></div></div></div>
+      <div class="transport-meta"><div><span>상차 예정 일시</span><strong id="orderTime"></strong></div><div><span>화물 / 컨테이너</span><strong id="orderCargo"></strong></div><span id="resultGate" class="badge"></span></div>
+    </section>
+    <div class="results-workspace">
+      <section class="panel map-panel" aria-labelledby="mapHeading">
+        <div class="panel-heading"><div><span class="eyebrow">ROUTE VIEW</span><h2 id="mapHeading">운송 경로</h2></div><div class="map-actions"><button type="button" id="retryMap" class="icon-button" aria-label="지도와 도로 경로 다시 불러오기" title="지도 새로고침">{{ icon('refresh') }}</button><button type="button" id="fitRoute" class="icon-button" aria-label="전체 경로 보기" title="전체 경로 보기">{{ icon('target') }}</button></div></div>
+        <div class="map-canvas-wrap"><div id="routeMap" role="region" aria-label="상하차지와 추천 차량의 이동 경로 지도"></div><div class="map-legend"><span><i class="legend-line loaded"></i>화물 운송</span><span><i class="legend-line empty"></i>공차 이동</span><span><i class="legend-vehicle"></i>후보 차량</span></div><div id="tileNotice" class="map-offline" role="status" hidden>배경 지도를 불러오지 못했습니다. 좌표 연결선으로 경로를 확인해주세요.</div></div>
+        <div class="map-metrics"><div><span>상차 → 하차 운송</span><strong id="loadedDistance">—</strong><small id="loadedTime"></small></div><div><span>선택 차량 공차 이동</span><strong id="emptyDistance">차량 선택 전</strong><small id="emptyTime"></small></div></div>
+        <div class="route-itinerary" id="routeItinerary"></div>
+        <div class="map-footnote"><p id="routeStatus" role="status">도로 경로를 확인하고 있습니다.</p></div>
+      </section>
+      <section class="recommendation-panel" aria-labelledby="candidateHeading">
+        <div class="candidate-section-heading"><div><h2 id="candidateHeading">추천 차량 <span id="candidateCount"></span></h2></div><span class="sort-label">{{ icon('target') }}공차거리 우선</span></div>
+        <div class="candidate-toolbar"><div class="segmented" role="group" aria-label="차량 소유 구분 필터"><button type="button" data-filter="all" aria-pressed="true">전체 <span id="allCount">0</span></button><button type="button" data-filter="자차" aria-pressed="false">자차 <span id="ownCount">0</span></button><button type="button" data-filter="용차" aria-pressed="false">용차 <span id="charterCount">0</span></button></div></div>
+        <div id="candidateList" class="candidate-list"></div>
+        <div id="emptyState" class="panel empty-state" hidden>{{ icon('truck') }}<h3 id="emptyTitle">추천 가능한 차량이 없습니다</h3><p id="emptyText"></p><a href="/?edit=1" class="button secondary">운송 정보 수정</a></div>
+      </section>
+    </div>
+    <section id="dispatchDock" class="dispatch-dock" aria-label="선택 차량 배차" hidden>
+      <div class="dock-selection"><span class="selected-truck">{{ icon('truck') }}</span><div><small>선택한 차량</small><strong id="selectedVehicle"></strong></div><span class="dock-divider"></span><div class="dock-estimate"><small>상차지 도착 예정</small><strong id="selectedArrival"></strong></div></div>
+      <div class="dock-actions"><span>상세 운송 정보를 확인 후 확정해주세요.</span><button type="button" class="button primary" id="openConfirm">배차 확정 {{ icon('arrow') }}</button></div>
+    </section>
+  </div>
+  <section id="successState" class="panel success-panel" hidden tabindex="-1"><span class="success-icon">{{ icon('check') }}</span><div class="eyebrow">DISPATCH CONFIRMED</div><h1>배차가 확정되었습니다.</h1><p>차량에 운송건이 배정되었으며, 다음 추천에 변경된 상태가 반영됩니다.</p><div id="successDetails"></div><a href="/" class="button primary">신규 운송건 입력 {{ icon('plus') }}</a></section>
+</div>
+<dialog id="confirmDialog" class="confirm-dialog" aria-labelledby="confirmTitle"><form method="dialog"><button class="dialog-close" aria-label="배차 확인 닫기">×</button></form><span class="section-icon">{{ icon('truck') }}</span><h2 id="confirmTitle">이 차량으로 배차할까요?</h2><p>확정 시 운송건이 저장되고 차량 가용 상태가 갱신됩니다.</p><div id="confirmDetails" class="confirm-details"></div><div class="alert alert-warning compact">지정 컨테이너를 운송할 차량 장비와 이후 예정 배차를 확인해주세요.</div><div id="confirmError" class="alert alert-error" role="alert" hidden></div><div class="dialog-actions"><button class="button secondary" type="button" id="cancelConfirm">돌아가기</button><button class="button primary" type="button" id="confirmDispatch">배차 확정</button></div></dialog>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='vendor/leaflet/leaflet.js') }}"></script><script type="module" src="{{ url_for('static', filename='js/results.js') }}?v=20260910-specified-v1"></script>{% endblock %}
+
+
+
+
+
+
